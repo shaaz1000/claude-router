@@ -1,0 +1,5 @@
+{
+  "main_model": "opus",
+  "thresholds": { "fast_max_chars": 160, "deep_score": 3, "max_score": 6 },
+  "log": true
+}
