@@ -13,7 +13,8 @@ INFRA FAIL (not a task failure) and pauses the benchmark. This calls real models
 
 Security: the agent may run node and npm, so treat it as able to run any code as your user, with your Claude
 login. Only run projects, tasks and check commands you wrote or have read. The agent and the checks get a
-scrubbed environment (see PASS_ENV); checks also get an empty HOME.
+scrubbed environment (see PASS_ENV), the agent's own subprocesses do not see the API key, and checks get an
+empty HOME. With --link-keychain the agent's HOME can still reach your login keychain.
 
   python3 bench/run.py --home-root /tmp/claude-router-bench/arms --out bench/results --cap-total 12 --link-keychain
 """
@@ -70,7 +71,8 @@ def run_one(arm, home, task, n, a):
     cap = round(min(a.cap_run, available), 2)
     work = os.path.join(a.out, "work", f"{arm}-{task['id']}-{n}"); shutil.rmtree(work, ignore_errors=True); shutil.copytree(a.project, work)
     subprocess.run("git init -q . && git add -A && git -c user.name=bench -c user.email=bench@example.com commit -qm init", cwd=work, shell=True, check=True)
-    env = clean_env(home, DISABLE_AUTOUPDATER="1")
+    # SUBPROCESS_ENV_SCRUB: Claude Code keeps the API key for its own calls but strips credentials from the Bash commands it starts.
+    env = clean_env(home, DISABLE_AUTOUPDATER="1", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB="1")
     if os.environ.get("BENCH_MOCK_URL"):      # pipeline test against a mock API: no real calls
         env.update({"ANTHROPIC_BASE_URL": os.environ["BENCH_MOCK_URL"], "ANTHROPIC_API_KEY": "sk-ant-test"})
     elif os.environ.get("ANTHROPIC_API_KEY"):  # the claude process needs it; the checks never get it
