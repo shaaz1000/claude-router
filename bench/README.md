@@ -16,6 +16,14 @@ python3 bench/report.py bench/results/results.jsonl
 * Runs are sequential and interleaved per task. Even passes swap neighbouring arms, so no arm always runs second on a warm prompt cache.
 * A usage limit, rate limit, API error or timeout is recorded as `INFRA FAIL`, not a task failure, and pauses the benchmark. Continue with `--resume --already-spent <dollars>`.
 
+## Security
+
+* **The agent can run code as you.** The default permissions let it run `node` and `npm test`, which is arbitrary code execution, and with `--link-keychain` its HOME can reach your Claude login. Only run projects and tasks you wrote or have read. For anything you do not fully trust, run the benchmark in a container or VM with a throwaway API key.
+* **A task's `check` is a shell command.** A tasks file from someone else can run anything on your machine. Read it first.
+* **Checks execute code the model wrote.** They run with an empty HOME and without the keychain link.
+* **Your shell's secrets are withheld.** The agent and the checks receive only a short allowlist of environment variables (`PASS_ENV` in `run.py`); cloud keys and tokens in your shell are not passed. `ANTHROPIC_API_KEY`, if set, goes to the `claude` process only.
+* `--allowed-tools` replaces the default permission rules. Keep it as narrow as your tasks allow.
+
 ## Plug in your own tasks
 
 A task is a prompt plus a check. Three things to provide:

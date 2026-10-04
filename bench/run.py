@@ -11,6 +11,10 @@ Each arm gets its own clean HOME under --home-root, so your real config, plugins
 Runs are sequential and interleaved per task. A usage limit, rate limit, API error or timeout is recorded as
 INFRA FAIL (not a task failure) and pauses the benchmark. This calls real models: read bench/README.md first.
 
+Security: the agent may run node and npm, so treat it as able to run any code as your user, with your Claude
+login. Only run projects, tasks and check commands you wrote or have read. The agent and the checks get a
+scrubbed environment (see PASS_ENV); checks also get an empty HOME.
+
   python3 bench/run.py --home-root /tmp/claude-router-bench/arms --out bench/results --cap-total 12 --link-keychain
 """
 import argparse, json, os, re, shutil, subprocess, sys, time
@@ -23,6 +27,16 @@ ARMS = {}       # loaded from --arms-file: {id: {"label", "model", "router": nul
 ALLOWED = ["Bash(node:*)", "Bash(npm test:*)", "Bash(npm run test:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(grep:*)", "Bash(ls:*)", "Bash(cat:*)"]
 budget = {"spent": 0.0}
 LIMIT = re.compile(r"usage limit|rate.?limit|limit reached|overloaded|\b429\b|\b529\b", re.I)
+# Only these variables reach the agent and the checks. Everything else in your shell (cloud keys, tokens, ...) is
+# withheld, because the agent can run code and the checks execute code the model wrote.
+PASS_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "TERM", "SHELL", "USER", "LOGNAME",
+            "SystemRoot", "ComSpec", "PATHEXT", "NVM_DIR", "NVM_BIN")
+
+
+def clean_env(home, **extra):
+    env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
+    env.update({"HOME": home, "USERPROFILE": home}); env.update(extra)
+    return env
 
 
 def order(arms, n):
@@ -56,10 +70,11 @@ def run_one(arm, home, task, n, a):
     cap = round(min(a.cap_run, available), 2)
     work = os.path.join(a.out, "work", f"{arm}-{task['id']}-{n}"); shutil.rmtree(work, ignore_errors=True); shutil.copytree(a.project, work)
     subprocess.run("git init -q . && git add -A && git -c user.name=bench -c user.email=bench@example.com commit -qm init", cwd=work, shell=True, check=True)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC"))}
-    env.update({"HOME": home, "DISABLE_AUTOUPDATER": "1"})
+    env = clean_env(home, DISABLE_AUTOUPDATER="1")
     if os.environ.get("BENCH_MOCK_URL"):      # pipeline test against a mock API: no real calls
         env.update({"ANTHROPIC_BASE_URL": os.environ["BENCH_MOCK_URL"], "ANTHROPIC_API_KEY": "sk-ant-test"})
+    elif os.environ.get("ANTHROPIC_API_KEY"):  # the claude process needs it; the checks never get it
+        env["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_API_KEY"]
     cmd = ["claude", "-p", task["prompt"], "--model", ARMS[arm]["model"], "--output-format", "stream-json", "--verbose",
            "--max-budget-usd", str(cap), "--permission-mode", "acceptEdits", "--allowedTools", *(a.allowed_tools or ALLOWED)]
     if ARMS[arm].get("effort"):
@@ -98,7 +113,9 @@ def run_one(arm, home, task, n, a):
     reply_p = os.path.join(a.out, "work", f"{arm}-{task['id']}-{n}.reply.txt"); open(reply_p, "w").write(res.get("result") or "")
     # A check runs in the working copy and exits 0 on pass. Default: node <checks>/<id>.js. A task may set its own "check" command.
     check_cmd = task.get("check") or f'node "{os.path.join(a.checks, task["id"] + ".js")}"'
-    chk = subprocess.run(check_cmd, shell=True, cwd=work, env={**os.environ, "BENCH_REPLY": reply_p, "BENCH_CHECKS": a.checks}, capture_output=True, text=True, timeout=120)
+    # The check executes code the model wrote: give it a scrubbed environment and an empty HOME (no keychain link, no credentials).
+    check_home = os.path.join(a.out, "work", "check-home"); os.makedirs(check_home, exist_ok=True)
+    chk = subprocess.run(check_cmd, shell=True, cwd=work, env=clean_env(check_home, BENCH_REPLY=reply_p, BENCH_CHECKS=a.checks), capture_output=True, text=True, timeout=120)
     sid = res.get("session_id"); tp = find_transcript(home, sid) if sid else None; u = session_usage(tp) if tp else {}
     return {"arm": arm, "arm_label": ARMS[arm].get("label", arm), "task": task["id"], "tier": task["tier"], "run": n, "passed": chk.returncode == 0 and not infra, "infra_fail": infra,
             "check": chk.stdout.strip()[-160:], "api_retries": api_errors[-3:],
