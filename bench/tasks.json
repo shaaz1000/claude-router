@@ -1,0 +1,10 @@
+[
+  {"id": "F1", "tier": "fast", "prompt": "rename getUser to fetchUser in api.js"},
+  {"id": "F2", "tier": "fast", "prompt": "what does slugify in utils.js return for \"Crème Brûlée & Co.\""},
+  {"id": "S1", "tier": "standard", "prompt": "add page and pageSize options to listOrders in orders.js. listOrders({ page, pageSize }) should return { items, total, page, pageSize }, with page 1 and pageSize 20 when they are left out. add tests"},
+  {"id": "S2", "tier": "standard", "prompt": "add applyCoupon(cart, code) to cart.js and export it. SAVE10 takes 10% off cart.subtotal, FREESHIP sets cart.shipping to 0, any other code throws an Error. it returns the updated cart. add tests"},
+  {"id": "S3", "tier": "standard", "prompt": "add an optional second argument currency to formatPrice in utils.js: USD by default, also EUR and GBP with their symbols. then accept it as orderSummary(order, { currency }) in orders.js and cartSummary(cart, { currency }) in cart.js. add tests"},
+  {"id": "D1", "tier": "deep", "prompt": "figure out why addItem in cart.js loses items when several calls hit the same cart together, and fix it"},
+  {"id": "D2", "tier": "deep", "prompt": "salesReport in report.js is slow with thousands of orders. optimize it without changing its output"},
+  {"id": "M1", "tier": "max", "prompt": "find the root cause of the intermittent deadlock in worker.js under load and fix it"}
+]

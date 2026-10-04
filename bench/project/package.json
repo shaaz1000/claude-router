@@ -1,0 +1,1 @@
+{ "name": "bench-shop", "version": "1.0.0", "private": true, "scripts": { "test": "node --test" } }

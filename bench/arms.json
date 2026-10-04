@@ -1,0 +1,6 @@
+{
+  "A": {"label": "Opus, no router", "model": "opus", "router": null},
+  "B": {"label": "Opus, router", "model": "opus", "router": "opus"},
+  "C": {"label": "Sonnet, no router", "model": "sonnet", "router": null},
+  "D": {"label": "Sonnet, router", "model": "sonnet", "router": "sonnet"}
+}
