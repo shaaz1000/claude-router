@@ -1,110 +1,163 @@
-# 🧭 Claude Router
+# Claude Router
 
-**Automatic model and effort routing for Claude Code.**
-Every prompt is classified locally in about 40 ms, at zero token cost, and sent to the right model: Haiku for lookups, Sonnet for clear everyday work, Opus for complex work that is still taking shape.
+**Does routing each Claude Code prompt to Haiku, Sonnet or Opus save money? In our benchmark, no.**
 
-Built on Anthropic's own guidance for the Claude 5.5 family: *Sonnet 5.5 for everyday work you can clearly describe, Opus 5.5 for complex work that's still taking shape, and Opus can delegate the clear parts to Sonnet.*
+Claude Router is a `UserPromptSubmit` hook that classifies every prompt locally and tells Claude Code which model should do the work, using subagents. We built it, verified that it routes correctly, then measured it against the two things it competes with: Opus alone and Sonnet alone.
 
-```
-🧭 fast → Haiku subagent
-🧭 standard → Sonnet subagent or Opus main
-🧭 deep → Opus main
-```
+Plain Sonnet with no router was the cheapest way to get a passing result. The router did not lower cost with an Opus lead, and made things worse with a Sonnet lead.
+
+The router is still here as an opt in tool, **off by default**, and the benchmark is here so you can rerun it on your own tasks.
+
+| Arm | Passed | Cost | Cost per passed task | Wall time |
+|---|---|---|---|---|
+| A. Opus, no router | 16/16 | $3.44 | $0.215 | 472 s |
+| B. Opus, router | 16/16 | $3.60 | $0.225 | 499 s |
+| **C. Sonnet, no router** | **16/16** | **$1.62** | **$0.101** | **317 s** |
+| D. Sonnet, router (budget mode) | 14/16 | $2.52 | $0.180 | 570 s |
+
+Measured on 2026-10-04 with Claude Code 2.1.289. Two runs per task per arm, so read every number here as directional.
 
 ---
 
 ## Contents
-1. [Why](#why)
-2. [Before and after](#before-and-after)
-3. [How it works](#how-it-works)
-4. [Install](#install)
-5. [How to use it](#how-to-use-it)
-6. [Configuration](#configuration)
-7. [claude.ai (web, desktop, mobile)](#claudeai-web-desktop-mobile)
-8. [How it was tested](#how-it-was-tested)
-9. [Limitations](#limitations)
-10. [Roadmap: making it better](#roadmap-making-it-better)
+1. [Hypothesis](#hypothesis)
+2. [Method](#method)
+3. [Results](#results)
+4. [Why routing lost](#why-routing-lost)
+5. [Limitations](#limitations)
+6. [Rerun it on your own tasks](#rerun-it-on-your-own-tasks)
+7. [The router: an opt in tool](#the-router-an-opt-in-tool)
+8. [What we learned about Claude Code](#what-we-learned-about-claude-code)
+9. [Testing](#testing)
 
 ---
 
-## Why
+## Hypothesis
 
-Picking a model by hand for every prompt is tedious, so most people leave one model on all day. That means either paying Opus prices to rename a variable, or asking Sonnet to untangle an architecture problem it should not own.
+Most people leave one model on all day. If a cheap local classifier sent lookups to Haiku, clear work to Sonnet and open ended work to Opus, a session should cost less than Opus alone without losing quality, and should use fewer Opus tokens, which is what counts against subscription limits.
 
-Claude Router makes that choice for you on every prompt, and you can override it with one word.
-
----
-
-## Before and after
-
-### Without the router
-| You type | What runs | Problem |
-|---|---|---|
-| `rename getUser to fetchUser` | Your session model (often Opus) | Premium model on trivial work |
-| 300 line log + "which line has 10:42?" | Your session model | Fine, but nothing stops you overpaying |
-| `not sure how to structure billing` | Sonnet, if you left it on Sonnet | Open ended judgment on the cheaper model |
-| Every prompt | Same effort level | Effort never matches the task |
-
-### With the router (default mode)
-| You type | Tier | What runs |
-|---|---|---|
-| `rename getUser to fetchUser` | fast | **Haiku 4.5** subagent |
-| `add pagination to /orders with tests` | standard | **Sonnet 5.5** subagent (effort high), Opus reviews |
-| 300 line log + "which line has 10:42?" | standard | Pasted content is not treated as complexity |
-| `not sure how to structure billing` | deep | **Opus 5.5** main session |
-| `find the root cause of the deadlock` | max | **Opus 5.5**, told to think thoroughly |
-| `yes go ahead` | standard | Stays in main session, which holds the context |
-
-### Project history: v1 → v4
-| Version | Change | Why |
-|---|---|---|
-| v1 | Keyword scorer that rewrote `effortLevel` per prompt | First attempt |
-| v2 | Separated what you **wrote** from what you **pasted** | v1 sent a 300 line log with a trivial question to Opus at max effort |
-| v2 | Haiku became strict opt in; plain English symptom words added | Fresh test set exposed real bugs routed to Haiku |
-| v3 | Dropped per prompt effort switching; routing moved to subagents | Tested inside Claude Code 2.1.289: `effortLevel` is read only at session start |
-| v3 | Ignores agent completion notices; agents run in foreground | Found a possible delegation loop in real Claude Code |
-| v4 | **Opus leads, Sonnet executes** became the default | Matches Anthropic's Sonnet 5.5 guidance |
-| v4 | "Work still taking shape" signals route to Opus | `not sure how`, `best way to`, `pros and cons`, `should we use` |
-
-Full details: [CHANGELOG.md](CHANGELOG.md).
+A hook cannot change the session's model or effort, so the router works by telling the lead model to delegate to subagents that pin their own model and effort.
 
 ---
 
-## How it works
+## Method
 
+**Tasks.** Eight tasks in a small Node project ([bench/project](bench/project)): 2 fast, 3 standard, 2 deep, 1 max, labeled by the router's own classifier. Each has a hidden automatic check ([bench/checks](bench/checks)) that never enters the working copy during a run. Every check fails on the untouched project and passes on a reference solution.
+
+| Task | Tier | What it asks |
+|---|---|---|
+| F1 | fast | Rename a function |
+| F2 | fast | Say what a function returns for a given input |
+| S1 | standard | Add pagination to a list function, with tests |
+| S2 | standard | Add a coupon function, with tests |
+| S3 | standard | Add a currency argument across three files, with tests |
+| D1 | deep | Find and fix lost updates under concurrency |
+| D2 | deep | Make a slow report fast without changing its output |
+| M1 | max | Find and fix an intermittent deadlock |
+
+**Arms.** A: Opus, no router. B: Opus with the router. C: Sonnet, no router. D: Sonnet with the router in budget mode, where Opus subagents write plans for deep work.
+
+**Conditions.**
+* Each arm ran in its own clean HOME with no plugins, no other hooks and no user settings. Both lead models ran at `medium` effort, confirmed from the transcripts.
+* `claude -p`, one prompt per session, 2 runs per task per arm: 64 runs.
+* Runs were sequential and interleaved per task. The second pass swapped the order within each model pair, so neither arm always ran second.
+* Cost and tokens come from the per model usage Claude Code reports for each session (`modelUsage`), at API prices. Prices are from the [official pricing page](https://platform.claude.com/docs/en/about-claude/pricing), read on 2026-10-04:
+
+| Per million tokens | Input | Output | Cache write (1 hour) | Cache read |
+|---|---|---|---|---|
+| Opus 5.5 | $4 | $20 | $8 | $0.20 |
+| Sonnet 5.5 | $2 | $10 | $4 | $0.20 |
+
+---
+
+## Results
+
+All 64 runs finished; none hit a usage or rate limit.
+
+| Arm | Passed | Cost | Cost per passed task | Opus tokens | Opus share of all tokens | Cache read share of input | Wall time |
+|---|---|---|---|---|---|---|---|
+| A. Opus, no router | 16/16 | $3.44 | $0.215 | 2,099,385 | 100% | 86% | 472 s |
+| B. Opus, router | 16/16 | $3.60 | $0.225 | 1,831,017 | 86% | 84% | 499 s |
+| C. Sonnet, no router | 16/16 | $1.62 | $0.101 | 0 | 0% | 86% | 317 s |
+| D. Sonnet, router | 14/16 | $2.52 | $0.180 | 693,391 | 28% | 85% | 570 s |
+
+**Variance between the two passes**
+
+| Arm | Cost, pass 1 / pass 2 | Cost per passed task, pass 1 / pass 2 | Opus tokens, pass 1 / pass 2 |
+|---|---|---|---|
+| A | $1.61 / $1.82 | $0.201 / $0.228 | 871,571 / 1,227,814 |
+| B | $1.78 / $1.82 | $0.222 / $0.227 | 896,631 / 934,386 |
+| C | $0.78 / $0.83 | $0.098 / $0.104 | 0 / 0 |
+| D | $1.22 / $1.30 | $0.174 / $0.186 | 278,318 / 415,073 |
+
+**Reading the numbers**
+
+* **Best cost per passed task: plain Sonnet (C)**, at $0.098 to $0.104, with every run passing. That is about half of either Opus arm.
+* **Router with an Opus lead (B against A): no saving.** B cost $0.16 more than A. A's own two passes differ by $0.21, so the arms cannot be told apart on cost.
+* **Opus tokens (B against A): not established.** B used 13% fewer Opus tokens in total, but A alone moved 41% between its two passes.
+* **Router with a Sonnet lead (D against C): worse on every measure.** 56% more cost, 80% more wall time, two failures, and 693,391 Opus tokens where plain Sonnet used none.
+
+**The two failures.** Both are arm D on the rename task. The Haiku subagent renamed the function in the file the prompt named, and the Sonnet lead saw that a test still used the old name and asked whether to fix it rather than fixing it. The project's own test suite was left failing. The other three arms updated the test in all six runs. The prompt did say "in api.js", so this is a strict check; counting both as passes would make D 16/16 at $0.158 per passed task, still well behind C.
+
+Full per task table, per model tokens and routing observed in each run: [bench/results/report.md](bench/results/report.md). Raw rows: [bench/results/results.jsonl](bench/results/results.jsonl).
+
+---
+
+## Why routing lost
+
+**1. A small task's cost is mostly the session's own startup, and routing cannot shrink it.**
+Cache writes were 62 to 69% of cost in every arm. Each session writes its system prompt and tool definitions to the prompt cache: about 17,900 tokens per run in arm A and 16,000 in arm C. For arm A that is roughly $0.14 of the $0.215 average run. The lead model pays this whatever the router decides.
+
+**2. A subagent starts cold, so delegation adds a second startup instead of replacing the first.**
+On the one task where the Opus lead delegated to Sonnet (S3, three files), the Opus side still cost $0.19 and the Sonnet subagent added $0.13 to $0.14, for $0.32 to $0.33 against $0.26 without the router. The subagent wrote 20,489 to 27,509 tokens of its own to the cache.
+
+**3. Cache reads cost the same on Opus and Sonnet.**
+Cache reads were 83 to 88% of input tokens in every arm, and both models charge $0.20 per million for them. Moving work to Sonnet saves nothing on the largest category of tokens. The saving that does exist, half price output and cache writes, is what plain Sonnet already gets in full.
+
+**4. Planning with Opus from a Sonnet lead is the expensive direction.**
+In budget mode the Opus planner alone cost $0.14 to $0.28 per run. The deadlock task cost $0.31 and $0.37 with it, against $0.10 and $0.10 for plain Sonnet, which also passed.
+
+**5. Haiku was not cheap in practice.**
+In an earlier end to end test with the first version of the routing rules, the Haiku subagent made 14 and 18 API calls to rename one symbol in two files. Those runs cost $0.21 in a clean config and $0.33 in a full one. The rules now keep fast work in the main session under an Opus lead.
+
+**6. Sonnet passed everything.**
+Sonnet alone passed all 16 runs, including the deep and max tasks. On these tasks there was no quality gap for Opus to close, so every dollar of Opus was overhead.
+
+---
+
+## Limitations
+
+* **Small sample.** 8 tasks, 2 runs each. Conclusions are directional.
+* **The tasks did not separate the models.** No task was hard enough for Sonnet to fail. Whether sending hard work to Opus improves quality when Sonnet would fail is untested, and it is the one case where a router could still pay.
+* **Small, single prompt tasks.** Long sessions with large contexts and real design work were not measured. Startup cost matters less there.
+* **Clean config only.** In a separate test with 18 plugins and `xhigh` effort, the same prompts cost 1.6 to 2.4 times more per call. That setup was not benchmarked.
+* **Headless only.** Everything ran under `claude -p`. In interactive sessions Claude Code runs subagents in the background, which this harness cannot reproduce.
+* **API prices, one day, one version.** Costs are notional API prices on 2026-10-04 with Claude Code 2.1.289. Subscription limits are metered differently; during the 31 minute run the account's 5 hour utilization moved from 29% to 44%, which includes other usage in that window.
+* **The classifier is imperfect.** It scores 89% on its most honest holdout set; see [Testing](#testing).
+* **One strict check.** See the two failures above.
+
+---
+
+## Rerun it on your own tasks
+
+```bash
+python3 bench/run.py --home-root /tmp/claude-router-bench/arms --out bench/results --cap-total 12 --link-keychain
+python3 bench/report.py bench/results/results.jsonl
 ```
-your prompt
-   │
-   ▼
-UserPromptSubmit hook  (local Python, ~40 ms, no API call)
-   │  1. split: what you wrote  vs  what you pasted (logs, code, JSON, CSV, docs)
-   │  2. score only what you wrote: complexity words, bug symptoms, ambiguity, scope
-   │  3. pick a tier: fast | standard | deep | max
-   ▼
-one line instruction injected into the turn  +  status line shown to you
-   │
-   ▼
-main session follows it: handle directly, or delegate to a subagent
-   ├── router-fast    Haiku            lookups, renames, small edits
-   ├── router-sonnet  Sonnet, high     clear, self contained work
-   ├── router-deep    Opus, high       plans (budget mode only)
-   └── router-max     Opus, xhigh      plans (budget mode only)
-```
 
-**Why subagents?** In Claude Code 2.1.289, a hook cannot change the session model, and `effortLevel` is read only when a session starts. Subagents carry their own `model` and `effort`, so they are the one mechanism that genuinely switches both per task. This was verified by inspecting real API requests.
+This calls real models: the published run cost $11.17 at API prices. `--cap-total` stops new runs once that much is spent.
 
-**Safety rules built in**
-* Haiku only gets short, clear, lookup style work with no bug symptoms and no bulk scope.
-* Prompts containing pasted content never go to Haiku, because the context lives in your message.
-* Follow ups (`yes go ahead`, `continue`) always stay in the main session.
-* Agent completion notices and slash command output are ignored, which prevents delegation loops.
-* The hook never blocks a prompt; on any error it stays silent.
+To use your own project, tasks, checks or arms, follow [bench/README.md](bench/README.md). If your tasks are hard enough that Sonnet fails some of them, you will be testing the case this benchmark could not.
 
 ---
 
-## Install
+## The router: an opt in tool
 
-Requires Claude Code and Python 3.8+. Works on macOS, Linux and Windows.
+Given the results, the router ships **off**. It stays installed and silent until you switch it on, or prefix a single prompt.
+
+### Install
+
+Requires Claude Code and Python 3.8+. Developed and tested on macOS.
 
 ```bash
 git clone https://github.com/<your-username>/claude-router.git
@@ -113,68 +166,93 @@ python3 install.py
 ```
 
 The installer:
-* copies the hook to `~/.claude/router/` and four agents to `~/.claude/agents/`
-* adds one `UserPromptSubmit` hook to `~/.claude/settings.json` (backup saved as `settings.json.bak`)
+* copies the hook to `~/.claude/router/`, four agents to `~/.claude/agents/` and three commands to `~/.claude/commands/`
+* adds one `UserPromptSubmit` hook to `~/.claude/settings.json`, keeping your other hooks and settings
+* saves the original as `settings.json.bak` once, and keeps it across reruns
 * adds a short protocol block to `~/.claude/CLAUDE.md`
-* keeps your existing hooks, permissions and rules, and is safe to rerun
-* refuses to touch anything if your `settings.json` is invalid
-
-Then restart Claude Code with the lead model:
-
-```bash
-claude --model opus
-```
+* starts **off**; a rerun keeps whatever you set
+* refuses to touch anything if your `settings.json` is not valid JSON
 
 **Uninstall:** `python3 install.py --uninstall` removes everything it added.
 
----
+### Switch it on and off
 
-## How to use it
+| In Claude Code | In a terminal | Effect |
+|---|---|---|
+| `/router-on` | `python3 ~/.claude/router/router.py --on` | Route every prompt |
+| `/router-off` | `python3 ~/.claude/router/router.py --off` | Stop routing |
+| `/router-status` | `python3 ~/.claude/router/router.py --status` | Show the current state |
 
-Just work normally. Each prompt shows where it went:
+The switch is stored in `~/.claude/router/config.json` and persists across sessions. The slash commands each take one model turn to echo the result; the terminal form is free.
+
+While it is on, every prompt shows a status line so you cannot forget it is running:
 
 ```
-> rename user_name to userName in profile.ts
-🧭 fast → Haiku subagent
+🧭 router ON · standard → Opus main, Sonnet subagent for larger changes
 ```
 
-### Override when it guesses wrong
-Start a prompt with a tier:
+While it is off, the hook prints nothing and logs nothing.
+
+### Route one prompt without switching it on
+
+Start a prompt with a tier. This works whether the router is on or off:
 
 | Prefix | Effect |
 |---|---|
-| `!fast` | Force Haiku |
-| `!std` | Force standard |
-| `!deep` | Force Opus |
-| `!max` | Force Opus, thorough |
+| `!fast` | Fast tier |
+| `!std` | Standard tier |
+| `!deep` | Deep tier |
+| `!max` | Max tier, thorough |
 
 ```
 > !deep add a retry to fetchPrices
+🧭 deep → Opus main (router off, this prompt only)
 ```
 
-### Check a prompt without running it
+### What each tier does
+
+| Tier | Opus lead (default) | Sonnet lead (budget mode) |
+|---|---|---|
+| fast | Opus answers directly and tersely. Haiku subagent only for bulk mechanical work | Haiku subagent |
+| standard | Opus does it directly. Sonnet subagent (effort high) only if the change likely touches 2+ files or 50+ lines | Sonnet does it directly |
+| deep | Opus directly. Analysis only unless you asked for a change | Opus subagent (effort high) writes a plan, Sonnet implements |
+| max | As deep, told to think thoroughly | Opus subagent (effort xhigh) writes a plan, Sonnet implements |
+
+In the benchmark the Opus lead followed these rules in 16 of 16 runs. The Sonnet lead followed them in 13 of 16: it skipped the Haiku delegation once and the Opus planner twice.
+
+### How it classifies
+
+```
+your prompt
+   │
+   ▼
+UserPromptSubmit hook  (local Python, no API call)
+   │  1. split: what you wrote  vs  what you pasted (logs, code, JSON, CSV, docs)
+   │  2. score only what you wrote: complexity words, bug symptoms, ambiguity, scope
+   │  3. pick a tier: fast | standard | deep | max
+   ▼
+one instruction injected into the turn  +  a status line shown to you
+```
+
+* Pasted content is not treated as complexity, and a prompt with pasted content never goes to the fast tier.
+* Follow ups such as `yes go ahead` are classified standard, never fast.
+* Agent completion notices, slash commands, messages from other sessions and built in autonomous loop ticks are ignored. A prompt you scheduled yourself (`/loop 5m ...` or a cron task) arrives as plain text and is routed like a typed prompt each time it fires.
+* The hook never blocks a prompt; on any error it stays silent.
+
+Check a prompt without running it:
+
 ```bash
 python3 ~/.claude/router/router.py --test "your prompt here"
-# tier=standard score=0 via=heuristic payload=0 route=Sonnet subagent or Opus main
+# tier=standard score=0 via=heuristic payload=0 route=Opus main, Sonnet subagent for larger changes
 ```
 
-### Review your routing
-`~/.claude/router/log.jsonl` records tier, score and length for every prompt. It **never** stores prompt text.
-
-### Debug
-```bash
-CLAUDE_ROUTER_DEBUG=1 claude --model opus
-# raw hook input goes to ~/.claude/router/debug.jsonl
-```
-
----
-
-## Configuration
+### Configuration
 
 `~/.claude/router/config.json`
 
 ```json
 {
+  "enabled": false,
   "main_model": "opus",
   "thresholds": { "fast_max_chars": 160, "deep_score": 3, "max_score": 6 },
   "log": true
@@ -183,71 +261,49 @@ CLAUDE_ROUTER_DEBUG=1 claude --model opus
 
 | Key | Meaning |
 |---|---|
-| `main_model: "opus"` | **Default.** Opus leads; clear work goes to Sonnet. Best quality per Anthropic's guidance. |
-| `main_model: "sonnet"` | **Budget mode.** Sonnet leads; Opus subagents write plans for deep work. Start with `claude --model sonnet`. |
-| `fast_max_chars` | Longest prompt Haiku may take. Lower is safer. |
-| `deep_score` | Score that sends work to Opus. Lower sends more to Opus. |
-| `max_score` | Score for the thorough tier. |
+| `enabled` | The on/off switch. Default `false`. |
+| `main_model: "opus"` | Opus leads. Start Claude Code with `claude --model opus`. |
+| `main_model: "sonnet"` | Budget mode: Sonnet leads and Opus subagents plan deep work. Start with `claude --model sonnet`. It lost to plain Sonnet in the benchmark. |
+| `fast_max_chars` | Longest prompt the fast tier may take. |
+| `deep_score`, `max_score` | Scores that send work to the deep and max tiers. Lower sends more. |
+| `log` | Write tier, score and length for each routed prompt to `~/.claude/router/log.jsonl`. Prompt text is never stored. |
 
-**Choosing a mode:** Opus 5.5 costs about twice Sonnet 5.5 per token ($4/$20 vs $2/$10 per million). Opus lead is better for long sessions with real design work; Sonnet lead is cheaper for mostly routine coding.
+`CLAUDE_ROUTER_DEBUG=1` writes the raw hook input, including prompt text, to `~/.claude/router/debug.jsonl`.
+
+### claude.ai (web, desktop, mobile)
+
+Hooks do not exist there. [web/claude-ai-router.md](web/claude-ai-router.md) is a short block for your profile preferences that asks Claude to flag a model mismatch in one line, so you can switch by hand. It was not part of the benchmark.
 
 ---
 
-## claude.ai (web, desktop, mobile)
+## What we learned about Claude Code
 
-claude.ai cannot switch its own model, so the router cannot run there. Instead, `web/claude-ai-router.md` contains a short block to paste into **Settings → Profile preferences** or a Project's instructions. Claude then flags a mismatch in one line, for example `⚙ Better fit: Opus, extended thinking on`, and you switch manually.
+Verified on 2.1.289 by reading the API requests Claude Code sent to a mock server, and from real session transcripts. Details in [docs/TESTING.md](docs/TESTING.md).
+
+* **A hook cannot change the model or effort.** `UserPromptSubmit` output has no field for either. Subagents with `model` and `effort` frontmatter are the mechanism that works.
+* **A top level `effortLevel` in user settings is ignored by Opus 5.5 and Sonnet 5.5.** Requests stayed at `medium`. The key that works is per model: `modelSettings.claude-opus-5-5.effortLevel`. It is read when a session starts; editing it mid session changed nothing.
+* **Haiku 4.5 takes no effort setting.** Requests to it carry no effort field.
+* **Foreground delegation only happens under `claude -p`.** Interactive sessions run subagents in the background and remove the `run_in_background` parameter, per the official docs.
+* **Other things arrive through `UserPromptSubmit`.** Agent completions come as `<task-notification>`, messages from other sessions as `<cross-session-message ...>`, and autonomous `/loop` ticks as built in text. A hook that treats them as user prompts will route them.
+* **Session cost and tokens are in the transcript.** The `cost-state` record carries the same per model usage `claude -p` reports. Summing per message usage undercounts subagent output tokens. [bench/usage.py](bench/usage.py) reads it.
 
 ---
 
-## How it was tested
+## Testing
 
-`bash tests/run_all.sh` runs everything below. Details in [docs/TESTING.md](docs/TESTING.md).
+`bash tests/run_all.sh` runs everything and exits nonzero on any failure.
 
 | Suite | Result |
 |---|---|
-| Classification, set used for tuning (70 prompts) | 99% |
-| Holdout 1 (45 prompts, later tuned against) | 100% |
-| **Holdout 2 (44 prompts, closest to real world)** | **89%**, misses lean to Sonnet, never Haiku |
-| Bad input, corrupt files, 40 parallel sessions | All pass |
-| Performance, up to 5 MB and adversarial inputs | Worst case 120 ms |
-| **End to end in real Claude Code 2.1.289** | All routes verified from actual API requests |
+| Classification, tuning set (70 prompts) | 99%, gate 95% |
+| Holdout 1 (45 prompts, later tuned against) | 100%, gate 85% |
+| Holdout 2 (44 prompts, closest to real use) | 89%, gate 85%; first unseen run was 75% |
+| Complex tasks routed to the fast tier | 0 in every set |
+| On/off switch, prefixes, installer | 22 checks pass |
+| Bad input, non user prompts, 40 parallel sessions | All pass |
+| Performance, inputs up to 5 MB | Worst case 87 to 181 ms across runs |
 
-End to end results (mock API, real Claude Code binary):
-
-| Mode | Prompt | Request went to |
-|---|---|---|
-| Opus lead | rename foo to bar | `claude-haiku-4-5` |
-| Opus lead | add pagination with tests | `claude-sonnet-5-5`, effort high |
-| Opus lead | not sure how to structure billing | `claude-opus-5-5` main |
-| Sonnet lead | redesign the caching layer | `claude-opus-5-5`, effort high |
-| Sonnet lead | find the root cause of the deadlock | `claude-opus-5-5`, effort xhigh |
-
----
-
-## Limitations
-
-* **Keyword classification is roughly 85 to 90% accurate** on unseen prompts. Use the `!` prefixes when it is wrong.
-* **Subagents start with a fresh context.** Their quality depends on the brief the lead writes.
-* **Tests prove the plumbing, not model judgment.** The mock API returns scripted answers, so whether a real model follows each instruction perfectly was not measured.
-* **Auto mode adds one small safety check request** per delegation.
-* **Sonnet 5.5 may fall back to Sonnet 5** on higher risk cybersecurity tasks, per public reporting. Use `!deep` for security work.
-* **Claude Code internals change.** Facts here were verified on 2.1.289.
-
----
-
-## Roadmap: making it better
-
-Ordered by expected impact.
-
-1. **Optional Haiku classifier for uncertain prompts.** Call Haiku only when the keyword score sits near a threshold. This costs roughly a few hundred tokens per uncertain prompt and should lift accuracy well above 90%.
-2. **Learn from your overrides.** Every `!deep` or `!fast` is a labeled correction. Log them (without prompt text, or with opt in) and suggest threshold changes.
-3. **Conversation aware routing.** Read recent turns from the transcript so a short prompt in the middle of an architecture discussion is not treated as trivial.
-4. **Native effort switching.** If Claude Code exposes effort or model changes to hooks, route the main session directly instead of through subagents.
-5. **Cost dashboard.** Turn `log.jsonl` into a weekly report: prompts per tier and estimated savings.
-6. **Project profiles.** Per repository thresholds, for example always deep in a payments service.
-7. **Haiku 5.5.** When it ships, the `haiku` alias picks it up automatically; the fast tier can then safely take more work.
-
-Contributions welcome. Please add a labeled case to `tests/cases.py` for any routing bug you report.
+The routes were also verified end to end with real models: one prompt per tier, in a clean HOME and in a full user config. Method and findings are in [docs/TESTING.md](docs/TESTING.md); history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
