@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Claude Router v4: classifies each prompt locally (no API call, zero tokens)
+"""Claude Router v5: classifies each prompt locally (no API call, zero tokens)
 and routes it to a model + effort via subagents in Claude Code.
 
 Two modes (config "main_model"):
 
   opus (default, Anthropic's recommended pattern: Opus leads, Sonnet executes)
-    fast      -> router-fast subagent    (Haiku)
-    standard  -> router-sonnet subagent  (Sonnet) when clear and self contained
-    deep/max  -> main session            (Opus)
+    fast      -> main session            (Opus, terse); router-fast (Haiku) only for bulk work
+    standard  -> router-sonnet subagent  (Sonnet) when the change spans 2+ files or 50+ lines,
+                 otherwise main session
+    deep/max  -> main session            (Opus); analysis only unless a change was asked for
 
   sonnet (budget mode)
     fast      -> router-fast subagent    (Haiku)
@@ -23,6 +24,11 @@ Scores only what you WROTE. Pasted logs, code, data and documents are measured
 as payload: they raise the floor to "standard" (Sonnet handles big context
 fine) but never push a simple ask up to Opus.
 
+Off by default. In our benchmark (bench/) routing did not save money, so it is opt in:
+
+  python3 router.py --on | --off | --status     switch it; the setting lives in config.json and persists
+  !fast !std !deep !max                         prefix one prompt to route just that prompt while off
+
 Hook: UserPromptSubmit.   Test: python3 router.py --test "your prompt"
 """
 import json, os, re, sys
@@ -34,6 +40,7 @@ CONFIG_PATH = ROUTER_DIR / "config.json"
 LOG_PATH = ROUTER_DIR / "log.jsonl"
 
 DEFAULTS = {
+    "enabled": False,            # off by default: the hook stays silent unless a prompt starts with a ! prefix
     "main_model": "opus",        # what your main session runs on: opus (recommended) | sonnet
     "thresholds": {"fast_max_chars": 160, "deep_score": 3, "max_score": 6},
     "log": True,
@@ -90,9 +97,12 @@ LOOKUP = re.compile(r"^(list|show|find|where|what|which|git|grep|count)\b")
 FOLLOWUP = re.compile(r"^(y(es|eah|ep)?|ok(ay)?|sure|go( ahead)?|do it|continue|proceed|next|try again|again|"
                       r"same (for|with|thing)|now (do|the|apply)|and (also|then)|keep going|looks good|lgtm|perfect|"
                       r"haan|theek hai|kar do)\b")
-SYSTEM_PROMPT = re.compile(r"^\s*<(task-notification|command-name|command-message|command-args|"
+# Prompts Claude Code submits on its own. Captured from real hook input on 2.1.289: task-notification,
+# cross-session-message (carries attributes) and the built in autonomous loop prompt.
+SYSTEM_PROMPT = re.compile(r"^\s*(<(task-notification|command-name|command-message|command-args|"
                            r"local-command-stdout|local-command-stderr|bash-input|bash-stdout|bash-stderr|"
-                           r"user-memory-input|system-reminder)>")
+                           r"user-memory-input|system-reminder|cross-session-message|teammate-message|channel)[\s>]"
+                           r"|# Autonomous loop check\b)")
 OVERRIDES = {"!fast": "fast", "!std": "standard", "!deep": "deep", "!max": "max"}
 
 
@@ -210,39 +220,74 @@ def classify(prompt, cfg):
     return tier, score, "heuristic", payload
 
 
+# Delegation only pays for itself on larger changes: a subagent starts cold and the lead still reviews.
+BIG = "the change will likely touch 2 or more files or 50 or more lines"
+ASK_ONLY = ("Edit files only if the user asked for a change. If they asked a question or for analysis "
+            "(why, how, find the cause, compare options), reply with analysis only and leave files untouched.")
+
+
 def instructions(tier, cfg):
+    opus = cfg["main_model"] == "opus"
+    if tier == "fast" and opus:
+        return ("[router] tier=fast. Handle it directly and answer tersely. Delegate to the router-fast subagent "
+                "(run_in_background: false) only for bulk mechanical work across many files.")
     if tier == "fast":
         return ("[router] tier=fast. If the task needs no context from this conversation, "
                 "delegate it to the router-fast subagent with run_in_background: false. Answer tersely.")
-    opus = cfg["main_model"] == "opus"
     if tier == "standard" and opus:
-        return ("[router] tier=standard. If the task is clearly specified, self contained and more than "
-                "a few lines of work, brief the router-sonnet subagent (run_in_background: false), then "
-                "review its result. If it is tiny or depends on this conversation, handle it directly.")
+        return (f"[router] tier=standard. Delegate to the router-sonnet subagent (run_in_background: false) only if {BIG} "
+                "and the task does not depend on this conversation; then review its result. Otherwise do it directly.")
     if tier == "standard":
         return ("[router] tier=standard. Handle directly. Be concise. If it proves complex (unclear root "
                 "cause, design decision, multi file change), brief the router-deep subagent first "
                 "(run_in_background: false).")
     if opus:
         extra = " Think it through thoroughly." if tier == "max" else ""
-        return (f"[router] tier={tier}. Handle directly. Read the relevant code first, plan, "
-                "edit, then verify with tests or a run. Delegate clearly scoped sub parts to "
-                f"router-sonnet.{extra}")
+        return (f"[router] tier={tier}. Handle directly. Read the relevant code first. {ASK_ONLY} "
+                "When a change was asked for: plan, edit, then verify with tests or a run. Delegate a clearly "
+                f"scoped part to router-sonnet only if {BIG}.{extra}")
     agent = "router-max" if tier == "max" else "router-deep"
     return (f"[router] tier={tier}. Send a complete brief (goal, relevant files, constraints, "
-            f"what you already know) to the {agent} subagent with run_in_background: false, "
-            "wait for its plan, then implement and verify it yourself.")
+            f"what you already know) to the {agent} subagent with run_in_background: false and wait for its "
+            f"plan. {ASK_ONLY} When a change was asked for, implement the plan and verify it yourself.")
 
 
 def route(tier, cfg):
     if cfg["main_model"] == "opus":
-        return {"fast": "Haiku subagent", "standard": "Sonnet subagent or Opus main",
+        return {"fast": "Opus main (terse)", "standard": "Opus main, Sonnet subagent for larger changes",
                 "deep": "Opus main", "max": "Opus main (thorough)"}[tier]
     return {"fast": "Haiku subagent", "standard": "Sonnet main",
             "deep": "Opus subagent (high)", "max": "Opus subagent (xhigh)"}[tier]
 
 
+def status_text(cfg):
+    lead = "Opus lead" if cfg["main_model"] == "opus" else "Sonnet lead (budget mode)"
+    if cfg.get("enabled"):
+        return f"🧭 router ON ({lead}). Every prompt is routed. Turn off: /router-off"
+    return "🧭 router OFF. Prompts are not routed. A !fast, !std, !deep or !max prefix routes one prompt. Turn on: /router-on"
+
+
+def set_enabled(value):
+    """Persist the switch in config.json, keeping every other key the user set."""
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+        if not isinstance(raw, dict):
+            raw = {}
+    except Exception:
+        raw = {}
+    raw["enabled"] = value
+    ROUTER_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(raw, indent=2) + "\n")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--on", "--off", "--status"):
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")      # Windows consoles default to a legacy codepage
+        if sys.argv[1] != "--status":
+            set_enabled(sys.argv[1] == "--on")
+        print(status_text(load_config()))
+        return
     cfg = load_config()
     if len(sys.argv) > 2 and sys.argv[1] == "--test":
         tier, score, how, payload = classify(" ".join(sys.argv[2:]), cfg)
@@ -265,7 +310,10 @@ def main():
     if not isinstance(prompt, str) or not prompt.strip() or prompt.lstrip().startswith("/"):
         return
     if SYSTEM_PROMPT.match(prompt):
-        return        # agent completion notices etc. are not user prompts; routing them could loop
+        return        # agent notices, messages from other sessions and loop ticks are not user prompts
+    on = bool(cfg.get("enabled"))
+    if not on and not prompt.strip().lower().startswith(tuple(OVERRIDES)):
+        return        # router is off: no output, no log line
 
     tier, score, how, payload = classify(prompt, cfg)
 
@@ -278,11 +326,12 @@ def main():
         except Exception:
             pass
 
-    print(json.dumps({
-        "systemMessage": f"🧭 {tier} → {route(tier, cfg)}",
+    label = f"🧭 router ON · {tier} → {route(tier, cfg)}" if on else f"🧭 {tier} → {route(tier, cfg)} (router off, this prompt only)"
+    sys.stdout.write(json.dumps({
+        "systemMessage": label,
         "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                "additionalContext": instructions(tier, cfg)},
-    }, ensure_ascii=False))
+    }) + "\n")
 
 
 if __name__ == "__main__":
